@@ -1,4 +1,4 @@
-# Added HybridPatchEmbed
+# Added handling for asymmetric masking
 
 import torch
 import numpy as np
@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, einsum
 from einops import rearrange
+from ssl_losses import VICRegLoss
 
 def exists(val):
     return val is not None
@@ -76,7 +77,17 @@ class MARCo(nn.Module):
         
         self.attn_bias = get_alibi(attention_heads=self.attention_heads,
                                    num_patches=self.num_patches)
-        
+        self.ssl_projector = nn.Sequential(
+            nn.Linear(self.encoder_dim, 2048),
+            nn.BatchNorm1d(2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+            nn.BatchNorm1d(2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+        )
+
+        self.vicreg_loss = VICRegLoss()
         self.global_contrast_loss = ContrastLossInput(projection_input=self.encoder_dim,
                                                       projection_output=self.encoder_dim)
         
@@ -127,10 +138,6 @@ class MARCo(nn.Module):
     
     @torch.no_grad()
     def encode_patches(self, imgs):
-        """
-        Extract dense spatial features for linear segmentation probing.
-        Returns: (B, D, H, W)
-        """
         self.eval()
 
         imgs = imgs.float()
@@ -141,28 +148,24 @@ class MARCo(nn.Module):
         attn_bias = self.attn_bias.to(device)
         attn_bias = attn_bias.repeat(B, 1, 1, 1)
 
-        # Unmasked encoders
         radar_tokens = self.radar_encoder(
             imgs=radar_imgs,
             attn_bias=attn_bias,
             mask_info=None
-        )                                   # (B, P, D)
-
+        )                                   
         optical_tokens = self.optical_encoder(
             imgs=optical_imgs,
             attn_bias=attn_bias,
             mask_info=None
-        )                                   # (B, P, D)
+        )                                  
 
-        # Cross-modal fusion
         joint_tokens = self.cross_encoder(
             x=radar_tokens,
             context=optical_tokens,
             alibi=attn_bias
-        )                                   # (B, P, D)
+        )                                  
 
-        # Reshape to spatial grid
-        H = W = int(self.num_patches ** 0.5)  # 12 × 12
+        H = W = int(self.num_patches ** 0.5) 
         feats = joint_tokens.transpose(1, 2).reshape(B, self.encoder_dim, H, W)
 
         return feats
@@ -170,11 +173,10 @@ class MARCo(nn.Module):
 
 
     def forward(self, imgs, radar_mask_info, optical_mask_info, rank=0, world_size=1):
-        # split stacked image into optical and radar
+
         radar_imgs = imgs[:, 12:, ...]
         optical_imgs = imgs[:, :12, ...]
 
-        # create independent random masks
         radar_masked_attn_bias = apply_mask_to_alibi(
             alibi=self.attn_bias.to(radar_imgs.device),
             ids_keep_queries=radar_mask_info['ids_keep'],
@@ -218,6 +220,13 @@ class MARCo(nn.Module):
         radar_GAP = self.GAP_FFN_radar(radar_encodings.mean(dim=1))
         optical_GAP = self.GAP_FFN_optical(optical_encodings.mean(dim=1))
 
+        # Project for redundancy reduction SSL
+        radar_proj = self.ssl_projector(radar_GAP)
+        optical_proj = self.ssl_projector(optical_GAP)
+
+        ssl_loss = self.vicreg_loss(radar_proj, optical_proj)
+
+
         # perform contrastive loss on unimodal representations
         contrastive_loss = self.global_contrast_loss(
             radar_features=radar_GAP,
@@ -227,6 +236,19 @@ class MARCo(nn.Module):
         )
 
         # create cross attention bias and create joint multimodal encodings
+        # Radar self-attention bias
+        radar_self_bias = apply_mask_to_alibi(
+            alibi=self.attn_bias.to(radar_imgs.device),
+            ids_keep_queries=radar_mask_info['ids_keep'],
+            ids_keep_keys=radar_mask_info['ids_keep'],
+            batch_size=radar_imgs.shape[0],
+            orig_seq_len=self.num_patches,
+            q_len=radar_mask_info['len_keep'],
+            k_len=radar_mask_info['len_keep'],
+            attention_heads=self.attention_heads
+        )
+
+        # Cross attention bias (radar → optical)
         cross_attn_bias = apply_mask_to_alibi(
             alibi=self.attn_bias.to(radar_imgs.device),
             ids_keep_queries=radar_mask_info['ids_keep'],
@@ -237,11 +259,12 @@ class MARCo(nn.Module):
             k_len=optical_mask_info['len_keep'],
             attention_heads=self.attention_heads
         )
-                
+
         joint_encodings = self.cross_encoder(
             x=radar_encodings,
             context=optical_encodings,
-            alibi=cross_attn_bias
+            self_alibi=radar_self_bias,
+            cross_alibi=cross_attn_bias
         )
 
         # reconstruct both sensors
@@ -259,7 +282,7 @@ class MARCo(nn.Module):
             target=patchified_imgs,
         )
 
-        return contrastive_loss, mae_loss
+        return contrastive_loss, mae_loss, ssl_loss
 
 
 class FFN(nn.Module):
@@ -362,13 +385,14 @@ class BaseTransformerCrossAttn(nn.Module):
             ]))
         self.norm_out = nn.LayerNorm(dim)
 
-    def forward(self, x, context, alibi):
+    def forward(self, x, context, self_alibi, cross_alibi):
         for self_attn, cross_attn, ffn in self.layers:
-            x = self_attn(x, alibi) + x
-            x = cross_attn(x, context, alibi) + x
+            x = self_attn(x, self_alibi) + x
+            x = cross_attn(x, context, cross_alibi) + x
             x = ffn(x) + x
         x = self.norm_out(x)
         return x
+
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
@@ -463,8 +487,7 @@ def apply_mask_to_alibi(
     attention_heads
 ):
 
-
-    alibi = alibi.repeat(batch_size, 1, 1, 1) 
+    alibi = alibi.repeat(batch_size, 1, 1, 1)  # (B, H, L, L)
 
     alibi = torch.gather(
         alibi,

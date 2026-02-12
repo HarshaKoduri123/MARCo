@@ -125,3 +125,4 @@ def save_training_history(history, path):
         json.dump(serializable_history, f, indent=2)
     
     print(f"Training history saved to {path}")
+

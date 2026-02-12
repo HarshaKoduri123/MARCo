@@ -9,7 +9,6 @@ from torch import distributed as dist
 from torch import nn, einsum
 from einops import rearrange
 
-
 def exists(val):
     return val is not None
 

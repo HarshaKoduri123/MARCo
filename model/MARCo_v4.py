@@ -1,4 +1,4 @@
-# Added HybridPatchEmbed
+# Added Distribution-aware cross attention
 
 import torch
 import numpy as np
@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, einsum
 from einops import rearrange
+from ssl_losses import VICRegLoss
 
 def exists(val):
     return val is not None
@@ -76,7 +77,17 @@ class MARCo(nn.Module):
         
         self.attn_bias = get_alibi(attention_heads=self.attention_heads,
                                    num_patches=self.num_patches)
-        
+        self.ssl_projector = nn.Sequential(
+            nn.Linear(self.encoder_dim, 2048),
+            nn.BatchNorm1d(2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+            nn.BatchNorm1d(2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+        )
+
+        self.vicreg_loss = VICRegLoss()
         self.global_contrast_loss = ContrastLossInput(projection_input=self.encoder_dim,
                                                       projection_output=self.encoder_dim)
         
@@ -127,10 +138,6 @@ class MARCo(nn.Module):
     
     @torch.no_grad()
     def encode_patches(self, imgs):
-        """
-        Extract dense spatial features for linear segmentation probing.
-        Returns: (B, D, H, W)
-        """
         self.eval()
 
         imgs = imgs.float()
@@ -141,28 +148,24 @@ class MARCo(nn.Module):
         attn_bias = self.attn_bias.to(device)
         attn_bias = attn_bias.repeat(B, 1, 1, 1)
 
-        # Unmasked encoders
         radar_tokens = self.radar_encoder(
             imgs=radar_imgs,
             attn_bias=attn_bias,
             mask_info=None
-        )                                   # (B, P, D)
-
+        )                                   
         optical_tokens = self.optical_encoder(
             imgs=optical_imgs,
             attn_bias=attn_bias,
             mask_info=None
-        )                                   # (B, P, D)
+        )                                  
 
-        # Cross-modal fusion
         joint_tokens = self.cross_encoder(
             x=radar_tokens,
             context=optical_tokens,
             alibi=attn_bias
-        )                                   # (B, P, D)
+        )                                  
 
-        # Reshape to spatial grid
-        H = W = int(self.num_patches ** 0.5)  # 12 × 12
+        H = W = int(self.num_patches ** 0.5) 
         feats = joint_tokens.transpose(1, 2).reshape(B, self.encoder_dim, H, W)
 
         return feats
@@ -170,11 +173,10 @@ class MARCo(nn.Module):
 
 
     def forward(self, imgs, radar_mask_info, optical_mask_info, rank=0, world_size=1):
-        # split stacked image into optical and radar
+
         radar_imgs = imgs[:, 12:, ...]
         optical_imgs = imgs[:, :12, ...]
 
-        # create independent random masks
         radar_masked_attn_bias = apply_mask_to_alibi(
             alibi=self.attn_bias.to(radar_imgs.device),
             ids_keep_queries=radar_mask_info['ids_keep'],
@@ -218,6 +220,13 @@ class MARCo(nn.Module):
         radar_GAP = self.GAP_FFN_radar(radar_encodings.mean(dim=1))
         optical_GAP = self.GAP_FFN_optical(optical_encodings.mean(dim=1))
 
+        # Project for redundancy reduction SSL
+        radar_proj = self.ssl_projector(radar_GAP)
+        optical_proj = self.ssl_projector(optical_GAP)
+
+        ssl_loss = self.vicreg_loss(radar_proj, optical_proj)
+
+
         # perform contrastive loss on unimodal representations
         contrastive_loss = self.global_contrast_loss(
             radar_features=radar_GAP,
@@ -259,7 +268,7 @@ class MARCo(nn.Module):
             target=patchified_imgs,
         )
 
-        return contrastive_loss, mae_loss
+        return contrastive_loss, mae_loss, ssl_loss
 
 
 class FFN(nn.Module):
@@ -299,32 +308,66 @@ class Attention(nn.Module):
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         return self.out(rearrange(out, 'b h n d -> b n (h d)'))
 
-
+# Updated here from general dot to including varient
 class CrossAttention(nn.Module):
-    def __init__(self, dim, attention_heads=8):
+    def __init__(self, dim, attention_heads=8, eps=1e-4):
         super().__init__()
         self.attention_heads = attention_heads
+        self.eps = eps
+
         dim_head = int(dim / attention_heads)
+        self.dim_head = dim_head
         self.scale = dim_head ** -0.5
+
         self.create_q = nn.Linear(dim, dim, bias=False)
         self.create_k = nn.Linear(dim, dim, bias=False)
         self.create_v = nn.Linear(dim, dim, bias=False)
+
         self.to_out = nn.Linear(dim, dim)
         self.input_norm = nn.LayerNorm(dim)
 
-    def forward(self, x, context, alibi):
+        self.dist_weight = nn.Parameter(torch.tensor(0.1))
+
+
+    def forward(self, x, context, alibi, use_distribution=True):
+
         x = self.input_norm(x)
         context = self.input_norm(context)
+
         q = self.create_q(x)
         k = self.create_k(context)
         v = self.create_v(context)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.attention_heads), (q, k, v))
-        attention_scores = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-        attention_scores = attention_scores + alibi
+
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.attention_heads)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=self.attention_heads)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=self.attention_heads)
+
+        if use_distribution:
+            var_q = q.var(dim=(0,2)) + self.eps   
+            var_k = k.var(dim=(0,2)) + self.eps  
+            uncertainty = 1.0 / (var_q + var_k) 
+
+            uncertainty = uncertainty / uncertainty.mean()
+            uncertainty = uncertainty.unsqueeze(0).unsqueeze(2)  
+
+            q = q * (1 + self.dist_weight * uncertainty)
+            k = k * (1 + self.dist_weight * uncertainty)
+
+
+        attention_scores = einsum(
+            'b h i d, b h j d -> b h i j', q, k
+        ) * self.scale
+
+        if exists(alibi):
+            attention_scores = attention_scores + alibi
+
         attn = attention_scores.softmax(dim=-1)
+
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
         out = rearrange(out, 'b h n d -> b n (h d)')
+
         return self.to_out(out)
+
 
 
 class BaseTransformer(nn.Module):
@@ -463,8 +506,7 @@ def apply_mask_to_alibi(
     attention_heads
 ):
 
-
-    alibi = alibi.repeat(batch_size, 1, 1, 1) 
+    alibi = alibi.repeat(batch_size, 1, 1, 1)  # (B, H, L, L)
 
     alibi = torch.gather(
         alibi,

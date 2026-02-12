@@ -11,7 +11,7 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from config import config
-from model.MARCo_v2 import MARCo, get_mask
+from model.MARCo_v4 import MARCo, get_mask
 from data import load_dfc_data, create_data_loaders, create_labeled_data_loaders
 from utils import set_seed, save_checkpoint, load_checkpoint, save_training_history
 from evaluation import (
@@ -83,15 +83,32 @@ class Trainer:
 
             batch_size = images.shape[0]
 
-            shared_mask_info = get_mask(
-                bsz=batch_size,
-                seq_len=self.config.NUM_PATCHES,
-                device=self.device,
-                mask_ratio=self.config.MASK_RATIO
-            )
+            # UPDATED HERE FROM SHARED MASK TO INVERTED MASK
+            # base_mask = get_mask(
+            #     bsz=batch_size,
+            #     seq_len=self.config.NUM_PATCHES,
+            #     device=self.device,
+            #     mask_ratio=self.config.MASK_RATIO
+            # )
 
+            # radar_mask_info = get_mask(
+            #     bsz=batch_size,
+            #     seq_len=self.config.NUM_PATCHES,
+            #     device=self.device,
+            #     mask_ratio=self.config.MASK_RATIO
+            # )
+
+            # optical_mask_info = get_mask(
+            #     bsz=batch_size,
+            #     seq_len=self.config.NUM_PATCHES,
+            #     device=self.device,
+            #     mask_ratio=1.0 - self.config.MASK_RATIO
+            # )
+            shared_mask_info = get_mask( bsz=batch_size, seq_len=self.config.NUM_PATCHES, device=self.device, mask_ratio=self.config.MASK_RATIO )
             radar_mask_info = shared_mask_info
             optical_mask_info = shared_mask_info
+        
+
 
             with autocast(device_type=self.device.type):
                 contrast_loss, mae_loss, ssl_loss  = self.model(
@@ -158,17 +175,34 @@ class Trainer:
             images = images.to(self.device).float()
 
             batch_size = images.shape[0]
-            
-            # Generate masks
-            shared_mask_info = get_mask(
-                bsz=batch_size,
-                seq_len=self.config.NUM_PATCHES,
-                device=self.device,
-                mask_ratio=self.config.MASK_RATIO
-            )
 
+            # UPDATED HERE FROM SHARED MASK TO INVERTED MASK
+            # base_mask = get_mask(
+            #     bsz=batch_size,
+            #     seq_len=self.config.NUM_PATCHES,
+            #     device=self.device,
+            #     mask_ratio=self.config.MASK_RATIO
+            # )
+
+            # radar_mask_info = get_mask(
+            #     bsz=batch_size,
+            #     seq_len=self.config.NUM_PATCHES,
+            #     device=self.device,
+            #     mask_ratio=self.config.MASK_RATIO
+            # )
+
+            # optical_mask_info = get_mask(
+            #     bsz=batch_size,
+            #     seq_len=self.config.NUM_PATCHES,
+            #     device=self.device,
+            #     mask_ratio=1.0 - self.config.MASK_RATIO
+            # )
+
+            shared_mask_info = get_mask( bsz=batch_size, seq_len=self.config.NUM_PATCHES, device=self.device, mask_ratio=self.config.MASK_RATIO )
             radar_mask_info = shared_mask_info
             optical_mask_info = shared_mask_info
+        
+
 
                         
             # Forward pass
