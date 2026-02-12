@@ -1,0 +1,6 @@
+__pycache__/
+dataset/
+logs/
+venv/
+checkpoints/
+results/
