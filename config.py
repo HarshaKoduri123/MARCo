@@ -34,7 +34,7 @@ class Config:
     WEIGHT_DECAY = 0.05
     EPOCHS = 100
     WARMUP_EPOCHS = 10
-    MASK_RATIO = 0.75
+    MASK_RATIO = 0.25
     USE_8BIT = True
 
     CONTRAST_WEIGHT = 1.0
@@ -65,7 +65,7 @@ class Config:
     # Logging
     # ------------------
     LOG_FREQUENCY = 100
-    VISUALIZE_FREQUENCY = 500
+    VISUALIZE_FREQUENCY = 50
 
 
 config = Config()

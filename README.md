@@ -27,4 +27,4 @@ To facilitate reproducibility, pretrained model checkpoints are available here:
 
 🔗 https://drive.google.com/drive/folders/1agxUrlOoDHzF7dKRF0xQ3oVNEnIrLRZf?usp=sharing  
 
-These checkpoints correspond to the configurations in MARCo_v2.
+These checkpoints correspond to the configurations in MARCo_v4.

@@ -204,8 +204,7 @@ class Trainer:
         
 
 
-                        
-            # Forward pass
+
             with autocast(device_type=self.device.type):
                 contrast_loss, mae_loss, ssl_loss  = self.model(
                     imgs=images,
@@ -221,8 +220,6 @@ class Trainer:
                     self.config.SSL_WEIGHT * ssl_loss
                 )
 
-            
-            # Update metrics
             total_loss += total_loss_combined.item()
             total_contrast += contrast_loss.item()
             total_mae += mae_loss.item()
@@ -232,15 +229,13 @@ class Trainer:
                 'val_contrast': contrast_loss.item(),
                 'val_mae': mae_loss.item()
             })
-        
-        # Calculate averages
+
         avg_loss = total_loss / len(self.val_loader)
         avg_contrast = total_contrast / len(self.val_loader)
         avg_mae = total_mae / len(self.val_loader)
         
         self.val_losses.append(avg_loss)
-        
-        # Log to TensorBoard
+
         self.writer.add_scalar('val/loss', avg_loss, epoch)
         self.writer.add_scalar('val/contrast_loss', avg_contrast, epoch)
         self.writer.add_scalar('val/mae_loss', avg_mae, epoch)
@@ -259,8 +254,6 @@ class Trainer:
             self.val_labels[:num_samples],
             batch_size=64
         )
-
- 
 
         reps_val, y_val = extract_representations(self.model, val_loader)
 
@@ -301,8 +294,6 @@ class Trainer:
             "w"
         ) as f:
             json.dump(cls_results, f, indent=4)
-
-        # Convert pixel → image labels ONCE
         if y_val.ndim > 1:
             y_val_img = pixel_to_image_labels(y_val)
         else:
@@ -350,7 +341,7 @@ class Trainer:
             dataloader=train_loader,
             num_classes=8,
             feature_dim=self.config.ENCODER_DIM,
-            epochs=20
+            epochs=10
         )
 
         seg_miou = evaluate_segmentation_probe(
@@ -365,7 +356,7 @@ class Trainer:
             "w"
         ) as f:
             json.dump({"mIoU": seg_miou}, f, indent=4)
-        # Store internally
+
         self.evaluation_results[epoch] = {
             "classification": cls_results,
             "segmentation": seg_miou
@@ -392,7 +383,6 @@ class Trainer:
             if epoch % 5 == 0:
                 self.run_evaluation(epoch)
             
-            # Save checkpoint
             if epoch % self.config.SAVE_FREQUENCY == 0 or epoch == self.config.EPOCHS - 1:
                 checkpoint_path = os.path.join(
                     self.config.CHECKPOINT_DIR,
@@ -407,7 +397,6 @@ class Trainer:
                     path=checkpoint_path
                 )
             
-            # Save best model
             if val_loss < self.best_loss:
                 self.best_loss = val_loss
                 best_path = os.path.join(self.config.CHECKPOINT_DIR, 'best_model.pth')
@@ -423,14 +412,12 @@ class Trainer:
             
             self.current_epoch = epoch + 1
         
-        # Final evaluation
         print(f"\n{'='*80}")
         print("Training Complete! Running Final Evaluation...")
         print(f"{'='*80}")
         
         self.run_evaluation(self.config.EPOCHS - 1)
-        
-        # Save final model
+
         final_path = os.path.join(self.config.CHECKPOINT_DIR, 'final_model.pth')
         save_checkpoint(
             model=self.model,
@@ -440,8 +427,7 @@ class Trainer:
             loss=self.best_loss,
             path=final_path
         )
-        
-        # Save training history
+
         history = {
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
@@ -457,8 +443,7 @@ class Trainer:
         
         history_path = os.path.join(config.RESULTS_DIR, 'training_history.json')
         save_training_history(history, history_path)
-        
-        # Close TensorBoard writer
+
         self.writer.close()
         
         print(f"\n{'='*80}")
@@ -468,15 +453,12 @@ class Trainer:
 
 
 def main():
-    # Set seed
+
     set_seed(42)
-    
-    # Load data
     print("Loading DFC data...")
     data_path = config.DATA_FILE
     train_images, train_labels, val_images, val_labels = load_dfc_data(data_path)
     
-    # Create data loaders
     print("Creating data loaders...")
     train_loader, val_loader = create_data_loaders(
         train_images, train_labels, 
@@ -484,7 +466,6 @@ def main():
         batch_size=config.BATCH_SIZE
     )
     
-    # Create model
     print("Creating MARCo model...")
     model = MARCo(
         patch_size=config.PATCH_SIZE,
@@ -497,14 +478,12 @@ def main():
         num_patches=config.NUM_PATCHES
     )
     
-    # Load checkpoint if specified
     if config.LOAD_CHECKPOINT:
         print(f"Loading checkpoint from {config.LOAD_CHECKPOINT}")
         model, optimizer, scheduler, start_epoch = load_checkpoint(
             model, config.LOAD_CHECKPOINT, config.DEVICE
         )
     
-    # Create trainer
     trainer = Trainer(
         model=model,
         train_loader=train_loader,

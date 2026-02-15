@@ -1,4 +1,4 @@
-# Added Distribution-aware cross attention
+# Added Distribution-aware cross attention + HybridPatchEmbed + VICRegLoss
 
 import torch
 import numpy as np
